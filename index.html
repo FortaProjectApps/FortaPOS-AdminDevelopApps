@@ -92,12 +92,12 @@
     const ALLOWED_CHARS = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
     const DEFAULT_FIREBASE_CONFIG = {
-      apiKey: "AIzaSyAnGMiKCOXlEernTJSTonClUxsUxurmo-E",
-      authDomain: "fortaposall.firebaseapp.com",
-      projectId: "fortaposall",
-      storageBucket: "fortaposall.firebasestorage.app",
-      messagingSenderId: "501904288549",
-      appId: "1:501904288549:web:3eb4af31e14c194e6788cc"
+      apiKey: "AIzaSyDLP4Jnfw1nJYqlY6Y_8ZzcVaLe3QYVyv8",
+    authDomain: "kasir-toko-nurjanah.firebaseapp.com",
+    projectId: "kasir-toko-nurjanah",
+    storageBucket: "kasir-toko-nurjanah.firebasestorage.app",
+    messagingSenderId: "109452166589",
+    appId: "1:109452166589:web:6348ce5183c4d41e74bed4"
     };
 
     const RECOMMENDED_RULES = `rules_version = '2';
@@ -128,6 +128,27 @@ service cloud.firestore {
     match /settings/{document=**} {
       allow read: if true;
       allow write: if true;
+    }
+
+    // Koleksi Toko & Kehadiran Owner (Real-Time Presence & Lisensi Aktif)
+    match /stores/{storeId} {
+      allow read: if true;
+      allow write: if request.auth != null || true;
+      match /{subcollection=**} {
+        allow read, write: if request.auth != null || true;
+      }
+    }
+
+    match /owners/{ownerId} {
+      allow read: if true;
+      allow write: if request.auth != null || true;
+    }
+
+    // Koleksi Global Real-Time Activity Logs (Transaksi, Stok, Login Kasir)
+    match /activity_logs/{activityId} {
+      allow read: if true;
+      allow create: if true;
+      allow update, delete: if request.auth != null || true;
     }
   }
 }`;
@@ -347,8 +368,16 @@ service cloud.firestore {
       const [quantity, setQuantity] = useState(1);
       const [isGenerating, setIsGenerating] = useState(false);
 
-      // Tab Aktif: 'licenses' | 'pricing' | 'activity_logs'
-      const [activeTab, setActiveTab] = useState('licenses');
+      // Tab Aktif: 'monitoring' | 'licenses' | 'pricing' | 'activity_logs'
+      const [activeTab, setActiveTab] = useState('monitoring');
+
+      // State Monitoring Real-Time Owner (Toko) & Aktivitas Kasir
+      const [storesList, setStoresList] = useState([]);
+      const [storeActivities, setStoreActivities] = useState([]);
+      const [ownerSearchQuery, setOwnerSearchQuery] = useState('');
+      const [ownerStatusFilter, setOwnerStatusFilter] = useState('all'); // 'all' | 'online' | 'offline'
+      const [ownerPackageFilter, setOwnerPackageFilter] = useState('all'); // 'all' | 'premium' | 'basic' | 'trial' | 'inactive'
+      const [nowTick, setNowTick] = useState(() => Date.now());
 
       // State Manajemen Kontrol Harga Paket (/settings/packages_pricing)
       const DEFAULT_PRICING = {
@@ -421,6 +450,14 @@ service cloud.firestore {
         }, 3200);
       };
 
+      // Interval deteksi real-time batas waktu lastSeen (setiap 10 detik)
+      useEffect(() => {
+        const timer = setInterval(() => {
+          setNowTick(Date.now());
+        }, 10000);
+        return () => clearInterval(timer);
+      }, []);
+
       // Sinkronkan tema ke elemen HTML
       useEffect(() => {
         if (isDark) {
@@ -437,6 +474,8 @@ service cloud.firestore {
         let unsubscribeFirestore = null;
         let unsubscribeLogs = null;
         let unsubscribePricing = null;
+        let unsubscribeStores = null;
+        let unsubscribeStoreActivities = null;
         let unsubscribeAuth = null;
 
         if (!firebaseConfig.projectId || firebaseConfig.projectId.trim() === '') {
@@ -446,6 +485,7 @@ service cloud.firestore {
           });
           loadLocalFallbackData();
           loadLocalLogs();
+          loadLocalStoresFallback();
           return;
         }
 
@@ -479,22 +519,31 @@ service cloud.firestore {
                 const items = [];
                 snapshot.forEach((docSnap) => {
                   const data = docSnap.data();
-                  const code = data.code || data.licenseCode || docSnap.id;
-                  const pkg = data.packageType || (code.startsWith('PREM') ? 'premium' : 'basic');
-                  const dur = Number(data.durationDays) || 30;
-                  const isUsed = Boolean(data.isUsed);
-                  const usedByStoreId = data.usedByStoreId || '';
+                  const code = data.licenseCode || data.code || docSnap.id;
+                  const pkg = String(data.packageType || (code.startsWith('PREM') ? 'premium' : 'basic')).toLowerCase();
+                  const dur = Number(data.duration || data.durationDays) || 30;
+                  const statusStr = String(data.status || (data.isUsed ? 'active' : 'unused')).toLowerCase();
+                  const isUsed = Boolean(data.isUsed) || statusStr === 'active' || statusStr === 'used';
+                  const activatedByStoreId = data.activatedByStoreId || data.usedByStoreId || '';
+                  const expiryVal = data.expiryDate || data.expiresAt || null;
 
                   items.push({
                     id: docSnap.id,
+                    licenseCode: code,
                     code,
                     packageType: pkg,
+                    duration: dur,
                     durationDays: dur,
+                    status: isUsed ? 'active' : 'unused',
                     isUsed,
-                    usedByStoreId,
+                    activatedByStoreId,
+                    usedByStoreId: activatedByStoreId,
+                    activatedByStoreName: data.activatedByStoreName || '',
+                    activatedByOwnerName: data.activatedByOwnerName || '',
                     createdAt: data.createdAt,
                     activatedAt: data.activatedAt || null,
-                    expiresAt: data.expiresAt || null
+                    expiryDate: expiryVal,
+                    expiresAt: expiryVal
                   });
                 });
 
@@ -592,6 +641,82 @@ service cloud.firestore {
               }
             );
 
+          // 4. Listener Real-Time Kehadiran & Paket Owner Toko (/stores)
+          unsubscribeStores = firestore.collection('stores')
+            .onSnapshot(
+              (snapshot) => {
+                const storeItems = [];
+                snapshot.forEach((docSnap) => {
+                  const d = docSnap.data() || {};
+                  const lic = d.license || {};
+                  storeItems.push({
+                    id: docSnap.id,
+                    storeId: d.storeId || d.uid || docSnap.id,
+                    storeName: d.storeName || lic.storeName || 'Toko Tanpa Nama',
+                    ownerName: d.ownerName || lic.ownerName || 'Owner',
+                    email: d.email || '-',
+                    phone: d.ownerWhatsapp || d.phone || '-',
+                    isOnlineFlag: Boolean(d.isOnline) || d.onlineStatus === 'online',
+                    lastSeen: d.lastSeen || d.lastSeenIso || d.activeDeviceLastSeen || d.updatedAt || null,
+                    lastActivity: d.lastActivity || '',
+                    lastActivityAction: d.lastActivityAction || '',
+                    lastActivityDetails: d.lastActivityDetails || '',
+                    lastActivityBy: d.lastActivityBy || '',
+                    lastActivityAt: d.lastActivityAt || d.lastActivityIso || d.updatedAt || null,
+                    packageType: lic.packageType || d.paket_aktif || 'none',
+                    packageName: lic.packageName || (lic.packageType === 'premium' ? 'Paket Premium' : lic.packageType === 'basic' ? 'Paket Basic' : 'Belum Aktif'),
+                    packageStatus: lic.status || d.status_paket || 'inactive',
+                    isTrial: Boolean(lic.isTrial) || lic.status === 'trial' || d.status_paket === 'trial',
+                    licenseCode: lic.licenseCode || lic.code || d.licenseCode || '-',
+                    expiryDate: lic.expiryDate || lic.expiresAt || d.expiryDate || null,
+                    createdAt: d.createdAt || null
+                  });
+                });
+                storeItems.sort((a, b) => getTimeNumber(b.lastSeen) - getTimeNumber(a.lastSeen));
+                setStoresList(storeItems);
+                try {
+                  localStorage.setItem('fortapos_admin_stores_cache', JSON.stringify(storeItems));
+                } catch (e) {}
+              },
+              (err) => {
+                console.warn("Stores listener fallback:", err);
+                loadLocalStoresFallback();
+              }
+            );
+
+          // 5. Listener Real-Time Log Aktivitas Operasional Kasir (/activity_logs)
+          unsubscribeStoreActivities = firestore.collection('activity_logs')
+            .onSnapshot(
+              (snapshot) => {
+                const actItems = [];
+                snapshot.forEach((docSnap) => {
+                  const d = docSnap.data() || {};
+                  actItems.push({
+                    id: docSnap.id,
+                    storeId: d.storeId || '-',
+                    storeName: d.storeName || 'Toko FortaPOS',
+                    ownerName: d.ownerName || 'Owner',
+                    userName: d.userName || 'Kasir',
+                    role: d.role || 'owner',
+                    action: d.action || 'Aktivitas',
+                    details: d.details || '',
+                    paket_aktif: d.paket_aktif || '',
+                    device: d.device || '',
+                    timestamp: d.createdAt || d.timestamp || new Date().toISOString()
+                  });
+                });
+                actItems.sort((a, b) => getTimeNumber(b.timestamp) - getTimeNumber(a.timestamp));
+                setStoreActivities(actItems.slice(0, 100));
+                try {
+                  localStorage.setItem('fortapos_admin_store_activities', JSON.stringify(actItems.slice(0, 60)));
+                } catch (e) {}
+              },
+              (err) => {
+                console.warn("Activity logs listener fallback:", err);
+                loadLocalStoresFallback();
+              }
+            );
+
         } catch (err) {
           setConnectionStatus({
             state: 'error',
@@ -605,9 +730,156 @@ service cloud.firestore {
           if (unsubscribeFirestore) unsubscribeFirestore();
           if (unsubscribeLogs) unsubscribeLogs();
           if (unsubscribePricing) unsubscribePricing();
+          if (unsubscribeStores) unsubscribeStores();
+          if (unsubscribeStoreActivities) unsubscribeStoreActivities();
           if (unsubscribeAuth) unsubscribeAuth();
         };
       }, [firebaseConfig]);
+
+      // Deteksi cerdas status Online/Offline Owner:
+      // Online (HIJAU) jika flag isOnline == true DAN tanda waktu lastSeen <= 90 detik terakhir
+      const isStoreOnlineRealTime = (store) => {
+        if (!store || !store.isOnlineFlag) return false;
+        const lastSeenMs = getTimeNumber(store.lastSeen);
+        if (!lastSeenMs) return false;
+        const diffSeconds = (nowTick - lastSeenMs) / 1000;
+        return diffSeconds <= 95; // Toleransi heartbeat 25s x 3.8
+      };
+
+      const formatRelativeTime = (val) => {
+        const ms = getTimeNumber(val);
+        if (!ms) return 'Belum tercatat';
+        const diffSec = Math.max(0, Math.floor((nowTick - ms) / 1000));
+        if (diffSec < 15) return 'Baru saja';
+        if (diffSec < 60) return `${diffSec} detik lalu`;
+        const diffMin = Math.floor(diffSec / 60);
+        if (diffMin < 60) return `${diffMin} menit lalu`;
+        const diffHour = Math.floor(diffMin / 60);
+        if (diffHour < 24) return `${diffHour} jam lalu`;
+        const diffDay = Math.floor(diffHour / 24);
+        return `${diffDay} hari lalu`;
+      };
+
+      const loadLocalStoresFallback = () => {
+        try {
+          const cachedStores = localStorage.getItem('fortapos_admin_stores_cache');
+          if (cachedStores) {
+            const parsed = JSON.parse(cachedStores);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setStoresList(parsed);
+            }
+          } else {
+            const now = Date.now();
+            setStoresList([
+              {
+                id: 'uid_toko_berkah_01',
+                storeId: 'uid_toko_berkah_01',
+                storeName: 'Toko Berkah Jaya',
+                ownerName: 'H. Ahmad Fauzi',
+                email: 'ahmad@tokoberkah.com',
+                phone: '081298765432',
+                isOnlineFlag: true,
+                lastSeen: new Date(now - 12000).toISOString(),
+                lastActivity: 'Transaksi Penjualan: Berhasil memproses TRX-892411 senilai Rp 145.000',
+                lastActivityAt: new Date(now - 45000).toISOString(),
+                packageType: 'premium',
+                packageName: 'Paket Premium',
+                packageStatus: 'active',
+                isTrial: false,
+                licenseCode: 'PREM-8KT2-9NWX-7MBP',
+                expiryDate: new Date(now + 340 * 86400000).toISOString()
+              },
+              {
+                id: 'uid_minimarket_sari_02',
+                storeId: 'uid_minimarket_sari_02',
+                storeName: 'Minimarket Sari Rasa',
+                ownerName: 'Siti Rahmawati',
+                email: 'siti@sarirasa.id',
+                phone: '085711223344',
+                isOnlineFlag: false,
+                lastSeen: new Date(now - 5400000).toISOString(),
+                lastActivity: 'Stok Produk: Memperbarui stok Beras Pandan Wangi 5kg (+25 sak)',
+                lastActivityAt: new Date(now - 5500000).toISOString(),
+                packageType: 'basic',
+                packageName: 'Paket Basic',
+                packageStatus: 'active',
+                isTrial: false,
+                licenseCode: 'BASE-4FGT-8JKX-29YM',
+                expiryDate: new Date(now + 78 * 86400000).toISOString()
+              },
+              {
+                id: 'uid_warung_maju_03',
+                storeId: 'uid_warung_maju_03',
+                storeName: 'Warung Sembako Maju',
+                ownerName: 'Budi Santoso',
+                email: 'budi.maju@gmail.com',
+                phone: '081377889900',
+                isOnlineFlag: true,
+                lastSeen: new Date(now - 20000).toISOString(),
+                lastActivity: 'Autentikasi Owner: Owner Budi Santoso berhasil login ke sistem kasir',
+                lastActivityAt: new Date(now - 120000).toISOString(),
+                packageType: 'basic',
+                packageName: 'Paket Basic (Trial 7 Hari)',
+                packageStatus: 'trial',
+                isTrial: true,
+                licenseCode: 'TRIAL-BASIC-7D',
+                expiryDate: new Date(now + 5 * 86400000).toISOString()
+              }
+            ]);
+          }
+
+          const cachedActs = localStorage.getItem('fortapos_admin_store_activities');
+          if (cachedActs) {
+            const parsedActs = JSON.parse(cachedActs);
+            if (Array.isArray(parsedActs) && parsedActs.length > 0) {
+              setStoreActivities(parsedActs);
+            }
+          } else {
+            const now = Date.now();
+            setStoreActivities([
+              {
+                id: 'act_demo_1',
+                storeId: 'uid_toko_berkah_01',
+                storeName: 'Toko Berkah Jaya',
+                ownerName: 'H. Ahmad Fauzi',
+                userName: 'H. Ahmad Fauzi',
+                role: 'owner',
+                action: 'Transaksi Penjualan',
+                details: 'Berhasil memproses TRX-892411 senilai Rp 145.000',
+                paket_aktif: 'premium',
+                device: 'Desktop / PC',
+                timestamp: new Date(now - 45000).toISOString()
+              },
+              {
+                id: 'act_demo_2',
+                storeId: 'uid_warung_maju_03',
+                storeName: 'Warung Sembako Maju',
+                ownerName: 'Budi Santoso',
+                userName: 'Budi Santoso',
+                role: 'owner',
+                action: 'Autentikasi Owner',
+                details: 'Owner Budi Santoso berhasil login via Firebase Auth.',
+                paket_aktif: 'basic',
+                device: 'Mobile Device',
+                timestamp: new Date(now - 120000).toISOString()
+              },
+              {
+                id: 'act_demo_3',
+                storeId: 'uid_minimarket_sari_02',
+                storeName: 'Minimarket Sari Rasa',
+                ownerName: 'Siti Rahmawati',
+                userName: 'Siti Rahmawati',
+                role: 'owner',
+                action: 'Stok Produk',
+                details: 'Memperbarui produk Beras Pandan Wangi 5kg',
+                paket_aktif: 'basic',
+                device: 'Desktop / PC',
+                timestamp: new Date(now - 5500000).toISOString()
+              }
+            ]);
+          }
+        } catch (e) {}
+      };
 
       const getTimeNumber = (val) => {
         if (!val) return 0;
@@ -863,31 +1135,44 @@ service cloud.firestore {
         return `${prefix}-${getBlock()}-${getBlock()}-${getBlock()}`;
       }
 
-      // Handler Pembuatan Voucher Massal
-      const handleGenerateLicense = async (e) => {
-        e.preventDefault();
+      // Fungsi Utama Pembuatan Lisensi Terpadu (generateLicense)
+      // Skema Standar Sinkron dengan index.html:
+      // { licenseCode, code, packageType, packageName, duration, durationDays,
+      //   status: "unused" | "active", isUsed, activatedByStoreId, usedByStoreId,
+      //   createdAt, activatedAt, expiryDate, expiresAt }
+      const generateLicense = async (e) => {
+        if (e && typeof e.preventDefault === 'function') e.preventDefault();
         setIsGenerating(true);
 
-        const performer = 'Developer (Admin)';
+        const performer = currentUser ? currentUser.email : 'Developer (Admin)';
         const isCloudReady = db && connectionStatus.state === 'connected';
         const newDocs = [];
+        const cleanDuration = Number(durationDays) || 30;
+        const cleanPkgType = String(packageType || 'basic').toLowerCase();
+        const cleanPkgName = cleanPkgType === 'premium' ? 'Paket Premium' : 'Paket Basic';
 
         for (let i = 0; i < quantity; i++) {
-          const voucherCode = generateLicenseCode(packageType);
+          const voucherCode = generateLicenseCode(cleanPkgType).trim().toUpperCase();
           const createdAt = isCloudReady && typeof firebase !== 'undefined' && firebase.firestore && firebase.firestore.Timestamp
             ? firebase.firestore.Timestamp.now()
             : new Date().toISOString();
 
-          // Objek data voucher baru sesuai skema blueprint FortaPOS
           const docData = {
-            code: voucherCode,
             licenseCode: voucherCode,
-            packageType: packageType,
-            durationDays: Number(durationDays),
+            code: voucherCode,
+            packageType: cleanPkgType,
+            packageName: cleanPkgName,
+            duration: cleanDuration,
+            durationDays: cleanDuration,
+            status: 'unused',
             isUsed: false,
+            activatedByStoreId: '',
             usedByStoreId: '',
+            activatedByStoreName: '',
+            activatedByOwnerName: '',
             createdAt: createdAt,
             activatedAt: null,
+            expiryDate: null,
             expiresAt: null
           };
 
@@ -901,19 +1186,9 @@ service cloud.firestore {
           try {
             const batch = db.batch();
             newDocs.forEach((item) => {
-              const docRef = db.collection('licenses').doc(item.code);
-              const docData = {
-                code: item.code,
-                licenseCode: item.licenseCode,
-                packageType: item.packageType,
-                durationDays: item.durationDays,
-                isUsed: item.isUsed,
-                usedByStoreId: item.usedByStoreId,
-                createdAt: item.createdAt,
-                activatedAt: item.activatedAt,
-                expiresAt: item.expiresAt
-              };
-              batch.set(docRef, docData);
+              const docRef = db.collection('licenses').doc(item.licenseCode);
+              const { id, ...firestorePayload } = item;
+              batch.set(docRef, firestorePayload);
             });
             await batch.commit();
             showToast(`${quantity} Voucher lisensi berhasil disimpan di Cloud Firestore /licenses!`);
@@ -967,6 +1242,7 @@ service cloud.firestore {
 
         setIsGenerating(false);
       };
+      const handleGenerateLicense = generateLicense;
 
       // Refresh Data Lisensi Manual
       const handleRefresh = async () => {
@@ -1122,10 +1398,13 @@ service cloud.firestore {
         if (db && connectionStatus.state === 'connected') {
           try {
             await db.collection('licenses').doc(code).update({
+              status: 'active',
               isUsed: true,
+              activatedByStoreId: ownerUid,
               usedByStoreId: ownerUid,
-              activatedAt: firebase.firestore.Timestamp.fromDate(now),
-              expiresAt: firebase.firestore.Timestamp.fromDate(expiresDate)
+              activatedAt: now.toISOString(),
+              expiryDate: expiresDate.toISOString(),
+              expiresAt: expiresDate.toISOString()
             });
             showToast(`Lisensi ${code} berhasil diklaim oleh UID Owner: ${ownerUid}`);
             await logActivity({
@@ -1178,9 +1457,14 @@ service cloud.firestore {
         if (db && connectionStatus.state === 'connected') {
           try {
             await db.collection('licenses').doc(code).update({
+              status: 'unused',
               isUsed: false,
+              activatedByStoreId: '',
               usedByStoreId: '',
+              activatedByStoreName: '',
+              activatedByOwnerName: '',
               activatedAt: null,
+              expiryDate: null,
               expiresAt: null
             });
             showToast(`Klaim lisensi ${code} dibatalkan. Status kini: Tersedia.`);
@@ -1491,6 +1775,52 @@ Terima kasih telah mempercayakan bisnis Anda bersama FortaPOS!`;
         });
       };
 
+      // Filter & Metrik Real-Time Owner (Toko)
+      const ownerMetrics = useMemo(() => {
+        let total = storesList.length;
+        let online = 0;
+        let offline = 0;
+        let premium = 0;
+        let basic = 0;
+
+        storesList.forEach((st) => {
+          if (isStoreOnlineRealTime(st)) online++;
+          else offline++;
+          if (st.packageType === 'premium' && st.packageStatus === 'active') premium++;
+          else if (st.packageType === 'basic' && (st.packageStatus === 'active' || st.packageStatus === 'trial')) basic++;
+        });
+
+        return { total, online, offline, premium, basic };
+      }, [storesList, nowTick]);
+
+      const filteredStores = useMemo(() => {
+        const q = ownerSearchQuery.trim().toLowerCase();
+        return storesList.filter((st) => {
+          const onlineNow = isStoreOnlineRealTime(st);
+          const matchSearch =
+            !q ||
+            (st.storeName && st.storeName.toLowerCase().includes(q)) ||
+            (st.ownerName && st.ownerName.toLowerCase().includes(q)) ||
+            (st.storeId && st.storeId.toLowerCase().includes(q)) ||
+            (st.email && st.email.toLowerCase().includes(q)) ||
+            (st.licenseCode && st.licenseCode.toLowerCase().includes(q));
+
+          const matchStatus =
+            ownerStatusFilter === 'all' ||
+            (ownerStatusFilter === 'online' ? onlineNow : !onlineNow);
+
+          const matchPkg =
+            ownerPackageFilter === 'all' ||
+            (ownerPackageFilter === 'trial'
+              ? st.isTrial
+              : ownerPackageFilter === 'inactive'
+              ? st.packageStatus !== 'active' && st.packageStatus !== 'trial'
+              : st.packageType === ownerPackageFilter);
+
+          return matchSearch && matchStatus && matchPkg;
+        });
+      }, [storesList, ownerSearchQuery, ownerStatusFilter, ownerPackageFilter, nowTick]);
+
       const truncateUid = (uid) => {
         if (!uid) return '';
         if (uid.length <= 14) return uid;
@@ -1651,9 +1981,27 @@ Terima kasih telah mempercayakan bisnis Anda bersama FortaPOS!`;
               </div>
             )}
 
-            {/* TAB NAVIGASI UTAMA: MANAJEMEN LISENSI VS KONTROL HARGA VS LOG AKTIVITAS */}
+            {/* TAB NAVIGASI UTAMA: MONITORING OWNER REAL-TIME, LISENSI, HARGA & LOG AUDIT */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 dark:border-brand-border pb-3">
               <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={() => setActiveTab('monitoring')}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                    activeTab === 'monitoring'
+                      ? 'bg-gradient-to-r from-emerald-500 to-teal-500 text-slate-950 shadow-md shadow-emerald-500/20'
+                      : 'bg-white dark:bg-brand-surface text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-brand-surface2 border border-slate-200 dark:border-brand-border'
+                  }`}
+                >
+                  <IconStore className="w-4 h-4" />
+                  <span>Monitoring Owner &amp; Aktivitas</span>
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-bold flex items-center gap-1 ${
+                    activeTab === 'monitoring' ? 'bg-slate-950/20 text-slate-950' : 'bg-emerald-500/15 text-emerald-500'
+                  }`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${ownerMetrics.online > 0 ? 'bg-emerald-500 animate-ping' : 'bg-slate-400'}`} />
+                    {ownerMetrics.online}/{ownerMetrics.total} ON
+                  </span>
+                </button>
+
                 <button
                   onClick={() => setActiveTab('licenses')}
                   className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
@@ -1707,7 +2055,12 @@ Terima kasih telah mempercayakan bisnis Anda bersama FortaPOS!`;
               </div>
 
               <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                {activeTab === 'pricing' ? (
+                {activeTab === 'monitoring' ? (
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                    <span>Live Stream: <code className="font-mono text-emerald-600 dark:text-emerald-400 font-semibold">/stores</code> &amp; <code className="font-mono text-cyan-600 dark:text-cyan-400 font-semibold">/activity_logs</code></span>
+                  </div>
+                ) : activeTab === 'pricing' ? (
                   <div className="flex items-center gap-1.5">
                     <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                     <span>Firestore Doc: <code className="font-mono text-emerald-600 dark:text-emerald-400 font-semibold">/settings/packages_pricing</code></span>
@@ -1726,7 +2079,267 @@ Terima kasih telah mempercayakan bisnis Anda bersama FortaPOS!`;
               </div>
             </div>
 
-            {activeTab === 'licenses' ? (
+            {activeTab === 'monitoring' ? (
+              /* ========================================================================= */
+              /* DASHBOARD MONITORING REAL-TIME OWNER (TOKO) & LOG AKTIVITAS KASIR         */
+              /* ========================================================================= */
+              <div className="space-y-6">
+                
+                {/* Kartu Metrik Kehadiran & Langganan Owner Real-Time */}
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="p-4 rounded-2xl bg-white dark:bg-brand-surface border border-slate-200 dark:border-brand-border shadow-sm">
+                    <div className="text-xs text-slate-500 dark:text-slate-400 font-medium">Total Toko Terdaftar</div>
+                    <div className="text-2xl font-extrabold text-slate-900 dark:text-white font-mono mt-1">{ownerMetrics.total}</div>
+                    <div className="text-[11px] text-slate-400 mt-1">Koleksi Firestore /stores</div>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-white dark:bg-brand-surface border border-emerald-500/30 shadow-sm">
+                    <div className="text-xs text-emerald-600 dark:text-emerald-400 font-bold flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_#10b981]" />
+                      SEDANG ONLINE (ON)
+                    </div>
+                    <div className="text-2xl font-extrabold text-emerald-600 dark:text-emerald-400 font-mono mt-1">{ownerMetrics.online}</div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">Aktif membuka aplikasi kasir</div>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-white dark:bg-brand-surface border border-slate-200 dark:border-brand-border shadow-sm">
+                    <div className="text-xs text-slate-500 dark:text-slate-400 font-bold flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-rose-500/80" />
+                      SEDANG OFFLINE (OFF)
+                    </div>
+                    <div className="text-2xl font-extrabold text-slate-700 dark:text-slate-300 font-mono mt-1">{ownerMetrics.offline}</div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">Tidak aktif / keluar aplikasi</div>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-white dark:bg-brand-surface border border-slate-200 dark:border-brand-border shadow-sm">
+                    <div className="text-xs text-cyan-600 dark:text-cyan-400 font-semibold">Distribusi Paket Aktif</div>
+                    <div className="text-2xl font-extrabold text-cyan-600 dark:text-cyan-400 font-mono mt-1">
+                      {ownerMetrics.premium} <span className="text-xs font-sans font-semibold text-slate-400">PREM</span>
+                    </div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                      Basic &amp; Trial: <span className="font-mono font-bold text-slate-700 dark:text-slate-200">{ownerMetrics.basic}</span> toko
+                    </div>
+                  </div>
+                </div>
+
+                {/* Grid Utama: Daftar Owner Toko (Kiri 2 Kolom) & Live Feed Log Aktivitas Kasir (Kanan 1 Kolom) */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+                  
+                  {/* PANEL KIRI (2/3): TABEL DAFTAR OWNER (TOKO) & STATUS ONLINE/OFFLINE */}
+                  <section className="lg:col-span-2 rounded-2xl bg-white dark:bg-brand-surface border border-slate-200 dark:border-brand-border p-5 lg:p-6 shadow-xl space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 dark:border-brand-border pb-4">
+                      <div>
+                        <h2 className="text-base font-extrabold text-slate-900 dark:text-white flex items-center gap-2">
+                          <IconStore className="w-5 h-5 text-emerald-500" />
+                          Daftar Owner (Toko) &amp; Kehadiran Real-Time
+                        </h2>
+                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                          Indikator otomatis berubah <strong className="text-emerald-500">HIJAU (ON)</strong> saat kasir dibuka dan <strong className="text-rose-400">ABU/MERAH (OFF)</strong> saat keluar atau tidak ada sinyal &gt;90 detik.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Filter & Pencarian Toko */}
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <div className="relative flex-1 min-w-[200px]">
+                        <IconSearch className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={ownerSearchQuery}
+                          onChange={(e) => setOwnerSearchQuery(e.target.value)}
+                          placeholder="Cari nama toko, nama owner, email, atau Store ID..."
+                          className="w-full pl-9 pr-3 py-2 bg-slate-50 dark:bg-brand-surface2 border border-slate-300 dark:border-brand-border rounded-xl text-xs text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-emerald-500"
+                        />
+                      </div>
+
+                      <select
+                        value={ownerStatusFilter}
+                        onChange={(e) => setOwnerStatusFilter(e.target.value)}
+                        className="bg-slate-50 dark:bg-brand-surface2 border border-slate-300 dark:border-brand-border rounded-xl px-3 py-2 text-xs text-slate-700 dark:text-slate-200 focus:outline-none focus:border-emerald-500"
+                      >
+                        <option value="all">Semua Status Kehadiran</option>
+                        <option value="online">Sedang Online (ON)</option>
+                        <option value="offline">Sedang Offline (OFF)</option>
+                      </select>
+
+                      <select
+                        value={ownerPackageFilter}
+                        onChange={(e) => setOwnerPackageFilter(e.target.value)}
+                        className="bg-slate-50 dark:bg-brand-surface2 border border-slate-300 dark:border-brand-border rounded-xl px-3 py-2 text-xs text-slate-700 dark:text-slate-200 focus:outline-none focus:border-emerald-500"
+                      >
+                        <option value="all">Semua Paket</option>
+                        <option value="premium">Paket Premium</option>
+                        <option value="basic">Paket Basic</option>
+                        <option value="trial">Masa Trial 7 Hari</option>
+                        <option value="inactive">Belum Aktif</option>
+                      </select>
+                    </div>
+
+                    {/* Tabel Daftar Toko */}
+                    <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-brand-border">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead>
+                          <tr className="bg-slate-100 dark:bg-brand-surface2/90 border-b border-slate-200 dark:border-brand-border text-slate-700 dark:text-slate-300 font-semibold uppercase tracking-wider text-[11px]">
+                            <th className="py-3 px-4">Status</th>
+                            <th className="py-3 px-4">Toko &amp; Owner</th>
+                            <th className="py-3 px-4">Paket Aktif</th>
+                            <th className="py-3 px-4">Aktivitas Terakhir</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200 dark:divide-brand-border/60">
+                          {filteredStores.length === 0 ? (
+                            <tr>
+                              <td colSpan={4} className="text-center py-10 text-slate-400">
+                                <div className="font-semibold text-slate-600 dark:text-slate-300">Belum ada toko yang sesuai filter</div>
+                                <p className="text-[11px] mt-1">Saat Owner mendaftar atau login di aplikasi Kasir (index.html), toko otomatis tampil secara real-time di sini.</p>
+                              </td>
+                            </tr>
+                          ) : (
+                            filteredStores.map((st) => {
+                              const isOnline = isStoreOnlineRealTime(st);
+                              const isPrem = st.packageType === 'premium' && st.packageStatus === 'active';
+                              const isTrial = st.isTrial || st.packageStatus === 'trial';
+                              const isActivePkg = st.packageStatus === 'active' || isTrial;
+
+                              return (
+                                <tr key={st.id} className="hover:bg-slate-50 dark:hover:bg-brand-surface2/40 transition-colors align-top">
+                                  {/* Indikator Visual ON / OFF */}
+                                  <td className="py-3.5 px-4 whitespace-nowrap">
+                                    {isOnline ? (
+                                      <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-950/80 border border-emerald-300 dark:border-emerald-700 text-emerald-800 dark:text-emerald-300 font-bold text-[11px]">
+                                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_#10b981]" />
+                                        <span>ONLINE</span>
+                                      </div>
+                                    ) : (
+                                      <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-200/80 dark:bg-slate-800/90 border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-rose-300 font-bold text-[11px]">
+                                        <span className="w-2.5 h-2.5 rounded-full bg-rose-500/80" />
+                                        <span>OFFLINE</span>
+                                      </div>
+                                    )}
+                                    <div className="text-[10px] font-mono text-slate-400 mt-1.5">
+                                      Seen: {formatRelativeTime(st.lastSeen)}
+                                    </div>
+                                  </td>
+
+                                  {/* Identitas Toko & Owner */}
+                                  <td className="py-3.5 px-4">
+                                    <div className="font-bold text-slate-900 dark:text-white text-sm">{st.storeName}</div>
+                                    <div className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">{st.ownerName}</div>
+                                    <div className="flex items-center gap-1.5 mt-1 text-[10px] font-mono text-slate-400">
+                                      <span title={st.storeId}>ID: {truncateUid(st.storeId)}</span>
+                                      <button
+                                        onClick={() => copyToClipboard(st.storeId, `Store ID ${st.storeId} disalin!`)}
+                                        className="hover:text-emerald-400 cursor-pointer"
+                                        title="Salin Store ID"
+                                      >
+                                        <IconCopy className="w-3 h-3" />
+                                      </button>
+                                    </div>
+                                  </td>
+
+                                  {/* Info Paket Berlangganan */}
+                                  <td className="py-3.5 px-4 whitespace-nowrap">
+                                    {isActivePkg ? (
+                                      <div>
+                                        <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-bold border ${
+                                          isPrem
+                                            ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 border-emerald-300 dark:border-emerald-800'
+                                            : isTrial
+                                            ? 'bg-amber-100 dark:bg-amber-950/80 text-amber-800 dark:text-amber-300 border-amber-300 dark:border-amber-800'
+                                            : 'bg-cyan-100 dark:bg-cyan-950 text-cyan-800 dark:text-cyan-300 border-cyan-300 dark:border-cyan-800'
+                                        }`}>
+                                          {isPrem ? 'PREMIUM' : isTrial ? 'TRIAL 7 HARI' : 'BASIC'}
+                                        </span>
+                                        <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400 mt-1">
+                                          Kode: {st.licenseCode || '-'}
+                                        </div>
+                                        {st.expiryDate && (
+                                          <div className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400">
+                                            Exp: {formatDate(st.expiryDate)}
+                                          </div>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-rose-100 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-300 dark:border-rose-800/60">
+                                        Belum Aktif
+                                      </span>
+                                    )}
+                                  </td>
+
+                                  {/* Aktivitas Terakhir Toko */}
+                                  <td className="py-3.5 px-4 max-w-xs">
+                                    {st.lastActivity ? (
+                                      <div>
+                                        <div className="text-xs text-slate-800 dark:text-slate-200 leading-snug line-clamp-2">
+                                          {st.lastActivity}
+                                        </div>
+                                        <div className="text-[10px] font-mono text-slate-400 mt-1">
+                                          {formatRelativeTime(st.lastActivityAt)} &middot; {formatDate(st.lastActivityAt)}
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <span className="text-[11px] text-slate-400 italic">Belum ada aktivitas terekam</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </section>
+
+                  {/* PANEL KANAN (1/3): STREAM LOG AKTIVITAS TERAKHIR REAL-TIME */}
+                  <section className="lg:col-span-1 rounded-2xl bg-white dark:bg-brand-surface border border-slate-200 dark:border-brand-border p-5 lg:p-6 shadow-xl flex flex-col justify-between space-y-4">
+                    <div className="border-b border-slate-200 dark:border-brand-border pb-3 flex items-center justify-between">
+                      <div>
+                        <h3 className="text-sm font-extrabold text-slate-900 dark:text-white flex items-center gap-2">
+                          <IconActivity className="w-4 h-4 text-cyan-400" />
+                          Live Feed Aktivitas Kasir
+                        </h3>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                          Stream real-time transaksi, perubahan stok, &amp; login Owner dari koleksi <code className="font-mono text-cyan-500">/activity_logs</code>.
+                        </p>
+                      </div>
+                      <span className="text-[11px] font-mono font-bold text-slate-400">{storeActivities.length} log</span>
+                    </div>
+
+                    <div className="space-y-3 max-h-[540px] overflow-y-auto pr-1 divide-y divide-slate-100 dark:divide-brand-border/50">
+                      {storeActivities.length === 0 ? (
+                        <div className="py-12 text-center text-xs text-slate-400">
+                          Menunggu aktivitas terbaru dari aplikasi kasir...
+                        </div>
+                      ) : (
+                        storeActivities.slice(0, 30).map((act) => (
+                          <div key={act.id} className="pt-3 first:pt-0 space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-bold text-xs text-emerald-600 dark:text-emerald-400 truncate">
+                                {act.storeName}
+                              </span>
+                              <span className="text-[10px] font-mono text-slate-400 shrink-0">
+                                {formatRelativeTime(act.timestamp)}
+                              </span>
+                            </div>
+                            <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                              {act.action}
+                            </div>
+                            <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
+                              {act.details}
+                            </p>
+                            <div className="text-[10px] font-mono text-slate-400 flex items-center gap-1.5 pt-0.5">
+                              <span>Oleh: {act.userName} ({act.role})</span>
+                              {act.device && <span>&middot; {act.device}</span>}
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </section>
+
+                </div>
+              </div>
+            ) : activeTab === 'licenses' ? (
               <>
                 {/* GRID UTAMA: FORM GENERATOR VOUCHER & RINGKASAN METRIK */}
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
